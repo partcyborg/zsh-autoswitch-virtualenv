@@ -25,7 +25,14 @@ function _validated_source() {
 
 function _virtual_env_dir() {
     local venv_name="$1"
-    printf "%s/%s" "$VIRTUAL_ENV_DIR" "$venv_name"
+    local venv_type=$(_get_venv_type "$PWD")
+    if [[ "$venv_type" == pyenv-virtualenv ]]; then
+        printf "%s/versions/%s" $(pyenv root) "$venv_name"
+    else
+        local VIRTUAL_ENV_DIR="${AUTOSWITCH_VIRTUAL_ENV_DIR:-$HOME/.virtualenvs}"
+        mkdir -p "$VIRTUAL_ENV_DIR"
+        printf "%s/%s" "$VIRTUAL_ENV_DIR" "$venv_name"
+    fi
 }
 
 
@@ -55,7 +62,11 @@ function _get_venv_type() {
     elif [[ -f "$venv_dir/poetry.lock" ]]; then
         venv_type="poetry"
     elif [[ -f "$venv_dir/requirements.txt" || -f "$venv_dir/setup.py" ]]; then
-        venv_type="virtualenv"
+        if [[ -n "$PYENV_VIRTUALENV_INIT" ]]; then
+            venv_type="pyenv-virtualenv"
+        else
+            venv_type="virtualenv"
+        fi
     fi
     printf "%s" "$venv_type"
 }
@@ -101,6 +112,11 @@ function _maybeworkon() {
         message="${message//\%venv_name/$venv_name}"
         message="${message//\%py_version/$py_version}"
         _autoswitch_message "${message}\n"
+
+        if [[ "$venv_type" == "pyenv-virtualenv" ]]; then
+            pyenv activate $venv_name
+            return
+        fi
 
         # If we are using pipenv and activate its virtual environment - turn down its verbosity
         # to prevent users seeing " Pipenv found itself running within a virtual environment" warning
@@ -180,6 +196,8 @@ function check_venv()
             file_permissions="$(/usr/bin/stat -f %OLp "$venv_path")"
         fi
 
+        local venv_type=$(_get_venv_type "$PWD")
+
         if [[ -f "$venv_path" ]] && [[ "$file_owner" != "$(id -u)" ]]; then
             printf "AUTOSWITCH WARNING: Virtualenv will not be activated\n\n"
             printf "Reason: Found a $AUTOSWITCH_FILE file but it is not owned by the current user\n"
@@ -200,7 +218,7 @@ function check_venv()
             # standard use case: $venv_path is a file containing a virtualenv name
             elif [[ -f "$venv_path" ]]; then
                 local switch_to="$(<"$venv_path")"
-                _maybeworkon "$(_virtual_env_dir "$switch_to")" "virtualenv"
+                _maybeworkon "$(_virtual_env_dir "$switch_to")" "$venv_type"
                 return
             # $venv_path actually is itself a virtualenv
             elif [[ -d "$venv_path" ]] && [[ -f "$venv_path/bin/activate" ]]; then
@@ -230,7 +248,12 @@ function _default_venv()
     elif [[ -n "$VIRTUAL_ENV" ]]; then
         local venv_name="$(_get_venv_name "$VIRTUAL_ENV" "$venv_type")"
         _autoswitch_message "Deactivating: ${AUTOSWITCH_BOLD}${AUTOSWITCH_PURPLE}%s${AUTOSWITCH_NORMAL}\n" "$venv_name"
-        deactivate
+        local curvenv_type=$(_get_venv_type "$PWD")
+        if [[ "$curvenv_type" == "pyenv-virtualenv" || "$venv_type" == "pyenv-virtualenv" ]]; then
+            pyenv deactivate
+        else
+            deactivate
+        fi
     fi
 }
 
@@ -255,6 +278,12 @@ function rmvenv()
                 local current_venv="$(basename $VIRTUAL_ENV)"
                 if [[ "$current_venv" = "$venv_name" ]]; then
                     _default_venv
+                fi
+                if [[ "$venv_type" == pyenv-virtualenv ]]; then
+                    printf "Uninstalling ${AUTOSWITCH_PURPLE}%s${AUTOSWITCH_NORMAL}...\n" "$venv_name"
+                    pyenv uninstall -f $current_venv
+                    /bin/rm "$AUTOSWITCH_FILE"
+                    return
                 fi
             fi
 
@@ -329,7 +358,7 @@ function mkvenv()
         else
             local venv_name="$(basename $PWD)-$(randstr)"
 
-            printf "Creating ${AUTOSWITCH_PURPLE}%s${NONE} virtualenv\n" "$venv_name"
+            printf "Creating ${AUTOSWITCH_PURPLE}%s${NONE} %s\n" "$venv_name" "$venv_type"
 
 
             if [[ -n "$AUTOSWITCH_DEFAULT_PYTHON" && ${params[(I)--python*]} -eq 0 ]]; then
@@ -340,18 +369,27 @@ function mkvenv()
                 params+="--python=$AUTOSWITCH_DEFAULT_PYTHON"
             fi
 
-            /bin/mkdir -p "$VIRTUAL_ENV_DIR"
-
-            if [[ ${params[(I)--verbose]} -eq 0 ]]; then
-                virtualenv $params "$(_virtual_env_dir "$venv_name")"
+            if [[ "$venv_type" == pyenv-virtualenv ]]; then
+                local args=(${params[@]})
+                local verbose_pos=${args[(I)--verbose]}
+                if [[ $verbose_pos -ne 0 ]]; then
+                    args[$verbose_pos]=()
+                fi
+                pyenv virtualenv $args $venv_name
             else
-                virtualenv $params "$(_virtual_env_dir "$venv_name")" > /dev/null
+                /bin/mkdir -p "$VIRTUAL_ENV_DIR"
+
+                if [[ ${params[(I)--verbose]} -eq 0 ]]; then
+                    virtualenv $params "$(_virtual_env_dir "$venv_name")"
+                else
+                    virtualenv $params "$(_virtual_env_dir "$venv_name")" > /dev/null
+                fi
             fi
 
             printf "$venv_name\n" > "$AUTOSWITCH_FILE"
             chmod 600 "$AUTOSWITCH_FILE"
 
-            _maybeworkon "$(_virtual_env_dir "$venv_name")" "virtualenv"
+            _maybeworkon "$(_virtual_env_dir "$venv_name")" "$venv_type"
 
             install_requirements
         fi
